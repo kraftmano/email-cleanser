@@ -1,0 +1,90 @@
+# ============================================================
+# Email Cleanser — Configuration
+# ============================================================
+# Edit these lists to tune classification. Re-run dry-run after changes.
+
+# ── Newsletter detection ────────────────────────────────────
+newsletter_domains:
+  - substack.com
+  - substackmail.com
+  - mail.beehiiv.com
+  - beehiiv.com
+  - convertkit.com
+  - mailchimp.com
+  - list-manage.com
+  - campaignmonitor.com
+  - createsend.com
+  - buttondown.email
+  - revue.email
+  - ghost.io
+  - sendfox.com
+  - mailerlite.com
+  - getrevue.co
+  # Add more newsletter platform domains here
+
+# ── Receipt / invoice detection ─────────────────────────────
+receipt_keywords:
+  # These are matched case-insensitively against subject lines
+  - receipt
+  - invoice
+  - order confirmation
+  - order confirmed
+  - payment confirmation
+  - payment received
+  - tax invoice
+  - purchase confirmation
+  - your order
+  - shipping confirmation
+  - delivery confirmation
+  - billing statement
+  - transaction
+  - e-receipt
+
+receipt_sender_domains:
+  # Domains whose mail is always treated as a receipt
+  - paypal.com
+  - square.com
+  - stripe.com
+  - shopify.com
+  - amazon.com
+  - apple.com
+  - google.com          # Google Play / Google Store receipts
+  # Add trusted merchant domains here
+
+# ── Quarantine (unwanted marketing) ─────────────────────────
+quarantine_age_days: 30          # only quarantine messages older than this
+max_moves_per_run: 2000          # safety cap for execution mode (future)
+
+# Unsubscribe signals searched in headers and body
+unsubscribe_signals:
+  - unsubscribe
+  - opt-out
+  - opt out
+  - manage your preferences
+  - email preferences
+  - update your preferences
+  - notification settings
+
+# ── Exclusions (never quarantine these) ─────────────────────
+excluded_sender_domains:
+  # Domains that should never be quarantined even if they
+  # match unsubscribe signals (e.g., your employer, bank)
+  []
+
+excluded_sender_addresses:
+  # Specific email addresses to protect
+  []
+
+# ── Folders ─────────────────────────────────────────────────
+folders:
+  newsletters: "Newsletters"
+  receipts: "Receipts"
+  quarantine: "CLEANSE_REVIEW"
+
+# ── Report settings ─────────────────────────────────────────
+report:
+  sample_size: 20               # how many examples per bucket in the report
+  include_body_snippet: false   # set true to include first 120 chars of body
+  output_formats:               # markdown, csv, or both
+    - markdown
+    - csv
