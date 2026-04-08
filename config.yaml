@@ -15,11 +15,9 @@ newsletter_domains:
   - campaignmonitor.com
   - createsend.com
   - buttondown.email
-  - revue.email
   - ghost.io
   - sendfox.com
   - mailerlite.com
-  - getrevue.co
   # Add more newsletter platform domains here
 
 # ── Receipt / invoice detection ─────────────────────────────

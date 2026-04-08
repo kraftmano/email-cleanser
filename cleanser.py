@@ -16,12 +16,18 @@ Usage:
 
 import argparse
 import csv
+import io
 import json
 import os
 import sys
 import time
 import webbrowser
 import yaml
+
+# Force UTF-8 output on Windows so emoji in print() don't crash
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -46,7 +52,7 @@ except ImportError:
 # Constants
 # ============================================================
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-SCOPES = ["Mail.ReadWrite"]  # ReadWrite needed for future move; Read for dry-run
+SCOPES = ["Mail.ReadWrite", "User.Read"]  # User.Read needed to identify the connected account
 TOKEN_CACHE_FILE = Path(__file__).parent / ".token_cache.json"
 CONFIG_FILE = Path(__file__).parent / "config.yaml"
 REPORT_DIR = Path(__file__).parent / "reports"
@@ -123,7 +129,7 @@ class GraphAuth:
     # Default: Microsoft's well-known "mobile/desktop" client ID for
     # personal accounts. Replace with YOUR app registration's client ID.
     CLIENT_ID = "YOUR_CLIENT_ID_HERE"
-    AUTHORITY = "https://login.microsoftonline.com/common"
+    AUTHORITY = "https://login.microsoftonline.com/organizations"
 
     def __init__(self):
         self._load_client_id()
@@ -138,28 +144,57 @@ class GraphAuth:
 
     def _load_client_id(self):
         """Load client ID from environment or .env file."""
+        # 1. Check environment variable
         env_id = os.environ.get("EMAIL_CLEANSER_CLIENT_ID")
-        if env_id:
+        if env_id and env_id != "your-client-id-goes-here":
             self.CLIENT_ID = env_id
+            print(f"  Client ID loaded from environment variable")
             return
+
+        # 2. Check .env file in same directory as this script
         env_file = Path(__file__).parent / ".env"
         if env_file.exists():
-            for line in env_file.read_text().splitlines():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
-                if line.startswith("EMAIL_CLEANSER_CLIENT_ID="):
-                    self.CLIENT_ID = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    return
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key == "EMAIL_CLEANSER_CLIENT_ID" and value and value != "your-client-id-goes-here":
+                        self.CLIENT_ID = value
+                        print(f"  Client ID loaded from .env file")
+                        return
+            print(f"  WARNING: .env file found at {env_file} but no valid CLIENT_ID in it")
+        else:
+            print(f"  WARNING: No .env file found at {env_file}")
+
         if self.CLIENT_ID == "YOUR_CLIENT_ID_HERE":
             print(
-                "ERROR: No Azure AD Client ID configured.\n"
-                "Set EMAIL_CLEANSER_CLIENT_ID in your environment or in .env file.\n"
-                "See README.md for setup instructions."
+                "\nERROR: No Azure AD Client ID configured.\n"
+                "Create a .env file in the same folder as cleanser.py with:\n"
+                "  EMAIL_CLEANSER_CLIENT_ID=your-actual-client-id\n"
+                "\nSee README.md for setup instructions."
             )
             sys.exit(1)
 
     def _save_cache(self):
         if self.cache.has_state_changed:
             TOKEN_CACHE_FILE.write_text(self.cache.serialize())
+
+    def clear_cache(self):
+        """Delete the cached token, forcing fresh authentication on next run."""
+        if TOKEN_CACHE_FILE.exists():
+            TOKEN_CACHE_FILE.unlink()
+            print("  Token cache cleared.")
+        # Reset the in-memory cache too
+        self.cache = msal.SerializableTokenCache()
+        self.app = msal.PublicClientApplication(
+            self.CLIENT_ID,
+            authority=self.AUTHORITY,
+            token_cache=self.cache,
+        )
 
     def get_token(self) -> str:
         accounts = self.app.get_accounts()
@@ -549,6 +584,11 @@ def main():
         default=str(CONFIG_FILE),
         help="Path to config YAML file",
     )
+    parser.add_argument(
+        "--reauth",
+        action="store_true",
+        help="Clear cached credentials and sign in fresh (use this to switch accounts)",
+    )
     args = parser.parse_args()
 
     # ── Load config ────────────────────────────────────────
@@ -558,9 +598,21 @@ def main():
     # ── Authenticate ───────────────────────────────────────
     print("\n🔑 Authenticating with Microsoft Graph …")
     auth = GraphAuth()
+    if args.reauth:
+        auth.clear_cache()
+        print("  Re-authentication requested — you will be prompted to sign in.")
     token = auth.get_token()
     client = GraphClient(token)
-    print("✅ Authenticated\n")
+
+    # Verify and display which account we're connected to
+    try:
+        me = client._get(f"{GRAPH_BASE}/me", params={"$select": "displayName,mail,userPrincipalName"})
+        email = me.get("mail") or me.get("userPrincipalName") or "unknown"
+        name = me.get("displayName") or ""
+        print(f"✅ Authenticated as: {name} <{email}>")
+        print("   If this is the wrong account, re-run with --reauth to switch.\n")
+    except Exception:
+        print("✅ Authenticated\n")
 
     # ── Build protected thread index ───────────────────────
     protected = client.get_sent_conversation_ids()
