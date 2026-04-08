@@ -79,6 +79,7 @@ class MessageRecord:
     matched_newsletter_rule: bool = False
     matched_receipt_rule: bool = False
     matched_quarantine_rule: bool = False
+    keep_subscription: bool = False  # quarantined but sender was recently engaged
     classification: Classification = Classification.UNTOUCHED
     rule_triggers: list = field(default_factory=list)
     body_snippet: str = ""
@@ -331,12 +332,51 @@ class GraphClient:
 # Classifier
 # ============================================================
 class EmailClassifier:
-    def __init__(self, config: dict, protected_threads: set[str]):
+    def __init__(self, config: dict, protected_threads: set[str], recently_engaged_domains: set[str] = None):
         self.cfg = config
         self.protected_threads = protected_threads
+        self.recently_engaged_domains = recently_engaged_domains or set()
         self.cutoff = datetime.now(timezone.utc) - timedelta(
             days=config.get("quarantine_age_days", 30)
         )
+
+    @staticmethod
+    def build_engaged_domains(raw_messages: list[dict], config: dict) -> set[str]:
+        """
+        Pre-pass over all inbox messages to find sender domains the user has
+        recently engaged with (read a newsletter-style email within the window).
+        These senders will be flagged keep_subscription=True when quarantined.
+        """
+        window = timedelta(days=config.get("engagement_window_days", 60))
+        cutoff = datetime.now(timezone.utc) - window
+        signals = config.get("unsubscribe_signals", [])
+        engaged = set()
+        for raw in raw_messages:
+            if not raw.get("isRead"):
+                continue
+            received = datetime.fromisoformat(
+                raw["receivedDateTime"].replace("Z", "+00:00")
+            )
+            if received < cutoff:
+                continue
+            headers = raw.get("internetMessageHeaders", []) or []
+            has_signal = any(
+                h.get("name", "").lower() == "list-unsubscribe" for h in headers
+            )
+            if not has_signal:
+                preview = (raw.get("bodyPreview", "") or "").lower()
+                has_signal = any(s in preview for s in signals)
+            if has_signal:
+                sender_obj = (
+                    (raw.get("sender", {}) or {}).get("emailAddress", {})
+                    or (raw.get("from", {}) or {}).get("emailAddress", {})
+                    or {}
+                )
+                email = (sender_obj.get("address", "") or "").lower()
+                domain = email.split("@")[-1] if "@" in email else ""
+                if domain:
+                    engaged.add(domain)
+        return engaged
 
     def _extract_sender(self, raw: dict) -> tuple[str, str, str]:
         sender_obj = (
@@ -438,6 +478,9 @@ class EmailClassifier:
             if unsub_body:
                 triggers.append("unsubscribe in body")
             triggers.append(f"unread + older than {self.cfg['quarantine_age_days']}d")
+            if domain in self.recently_engaged_domains:
+                rec.keep_subscription = True
+                triggers.append(f"keep_subscription (read within {self.cfg.get('engagement_window_days', 60)}d)")
             rec.rule_triggers = triggers
             return rec
 
@@ -490,11 +533,16 @@ class ReportGenerator:
             lines.append("")
             lines.append(f"## {cls.value} — sample (top {self.sample_size})")
             lines.append("")
-            header = "| # | Sender | Subject | Date | Triggers |"
-            sep = "|---|--------|---------|------|----------|"
+            is_quarantine = cls == Classification.QUARANTINE
+            if is_quarantine:
+                header = "| # | Sender | Subject | Date | Keep Sub? | Triggers |"
+                sep = "|---|--------|---------|------|:---------:|----------|"
+            else:
+                header = "| # | Sender | Subject | Date | Triggers |"
+                sep = "|---|--------|---------|------|----------|"
             if self.include_snippet:
-                header = "| # | Sender | Subject | Date | Triggers | Snippet |"
-                sep = "|---|--------|---------|------|----------|---------|"
+                header = header.rstrip("|") + " Snippet |"
+                sep = sep.rstrip("|") + "---------|"
             lines.append(header)
             lines.append(sep)
             for i, rec in enumerate(items, 1):
@@ -502,25 +550,49 @@ class ReportGenerator:
                 subj = self._esc(rec.subject[:80])
                 dt = rec.received_datetime.strftime("%Y-%m-%d")
                 triggers = self._esc("; ".join(rec.rule_triggers))
-                row = f"| {i} | {sender} | {subj} | {dt} | {triggers} |"
+                if is_quarantine:
+                    keep = "✓" if rec.keep_subscription else ""
+                    row = f"| {i} | {sender} | {subj} | {dt} | {keep} | {triggers} |"
+                else:
+                    row = f"| {i} | {sender} | {subj} | {dt} | {triggers} |"
                 if self.include_snippet:
-                    row = f"| {i} | {sender} | {subj} | {dt} | {triggers} | {self._esc(rec.body_snippet)} |"
+                    row = row.rstrip("|") + f" {self._esc(rec.body_snippet)} |"
                 lines.append(row)
 
         # Top senders in quarantine
         q = self.buckets[Classification.QUARANTINE]
         if q:
             domain_counts: dict[str, int] = defaultdict(int)
+            keep_counts: dict[str, int] = defaultdict(int)
             for r in q:
                 domain_counts[r.sender_domain] += 1
+                if r.keep_subscription:
+                    keep_counts[r.sender_domain] += 1
             top = sorted(domain_counts.items(), key=lambda x: -x[1])[:30]
             lines.append("")
             lines.append("## Quarantine — top sender domains")
             lines.append("")
-            lines.append("| Domain | Count |")
-            lines.append("|--------|------:|")
+            lines.append("| Domain | Count | Keep Sub? |")
+            lines.append("|--------|------:|:---------:|")
             for dom, cnt in top:
-                lines.append(f"| {dom} | {cnt:,} |")
+                keep = "✓" if dom in keep_counts else ""
+                lines.append(f"| {dom} | {cnt:,} | {keep} |")
+
+            # Keep-subscription summary
+            keep_domains = sorted(keep_counts.items(), key=lambda x: -x[1])
+            if keep_domains:
+                lines.append("")
+                lines.append("## Quarantine — keep-subscription domains")
+                lines.append("")
+                lines.append(
+                    "_These senders have quarantined emails but you've recently read "
+                    "their newsletters — the subscription will be preserved in v2._"
+                )
+                lines.append("")
+                lines.append("| Domain | Quarantined emails |")
+                lines.append("|--------|-------------------:|")
+                for dom, cnt in keep_domains:
+                    lines.append(f"| {dom} | {cnt:,} |")
 
         path.write_text("\n".join(lines), encoding="utf-8")
         print(f"  📝 Markdown report: {path}")
@@ -534,6 +606,7 @@ class ReportGenerator:
             "received_date",
             "is_read",
             "has_unsubscribe",
+            "keep_subscription",
             "rule_triggers",
         ]
         if self.include_snippet:
@@ -553,6 +626,7 @@ class ReportGenerator:
                     ),
                     "is_read": rec.is_read,
                     "has_unsubscribe": rec.has_unsubscribe_signal,
+                    "keep_subscription": rec.keep_subscription,
                     "rule_triggers": "; ".join(rec.rule_triggers),
                 }
                 if self.include_snippet:
@@ -631,9 +705,14 @@ def main():
         print("No messages found. Exiting.")
         return
 
+    # ── Build recently-engaged sender index ────────────────
+    print("🔍 Building recently-engaged sender index …")
+    engaged_domains = EmailClassifier.build_engaged_domains(raw_messages, config)
+    print(f"✅ Recently engaged domains: {len(engaged_domains):,}\n")
+
     # ── Classify ───────────────────────────────────────────
     print("🔍 Classifying messages …")
-    classifier = EmailClassifier(config, protected)
+    classifier = EmailClassifier(config, protected, engaged_domains)
     records = [classifier.classify(msg) for msg in raw_messages]
     print("✅ Classification complete\n")
 
