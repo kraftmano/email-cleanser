@@ -254,6 +254,33 @@ class GraphClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _post(self, url: str, data: dict) -> dict:
+        resp = self.session.post(url, json=data, timeout=30)
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 5))
+            print(f"  ⏳ Throttled — waiting {retry_after}s …")
+            time.sleep(retry_after)
+            return self._post(url, data)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_or_create_folder(self, display_name: str) -> str:
+        """Return folder ID by display name, creating it if it doesn't exist."""
+        data = self._get(f"{GRAPH_BASE}/me/mailFolders", params={"$top": 100})
+        for folder in data.get("value", []):
+            if folder.get("displayName", "").lower() == display_name.lower():
+                return folder["id"]
+        print(f"  📁 Creating folder '{display_name}' …")
+        result = self._post(f"{GRAPH_BASE}/me/mailFolders", {"displayName": display_name})
+        return result["id"]
+
+    def move_message(self, message_id: str, folder_id: str) -> None:
+        """Move a message to the specified folder."""
+        self._post(
+            f"{GRAPH_BASE}/me/messages/{message_id}/move",
+            {"destinationId": folder_id},
+        )
+
     def get_inbox_folder_id(self) -> str:
         data = self._get(f"{GRAPH_BASE}/me/mailFolders/Inbox")
         return data["id"]
@@ -641,6 +668,80 @@ class ReportGenerator:
 
 
 # ============================================================
+# Execution engine (v2)
+# ============================================================
+class ExecutionEngine:
+    """Moves classified emails to their destination folders."""
+
+    ACTIONABLE = {Classification.QUARANTINE, Classification.RECEIPT}
+
+    def __init__(self, client: GraphClient, config: dict, records: list[MessageRecord]):
+        self.client = client
+        self.cfg = config
+        self.records = records
+        self.max_moves = config.get("max_moves_per_run", 2000)
+
+    def run(self) -> dict:
+        folders_cfg = self.cfg.get("folders", {})
+        folder_map = {
+            Classification.QUARANTINE: folders_cfg.get("quarantine", "CLEANSE_REVIEW"),
+            Classification.RECEIPT: folders_cfg.get("receipts", "Receipts"),
+        }
+
+        to_move = [r for r in self.records if r.classification in self.ACTIONABLE]
+        to_move = to_move[: self.max_moves]
+
+        if not to_move:
+            print("  Nothing to move.")
+            return {}
+
+        # Show summary and ask for confirmation
+        by_bucket: dict[Classification, list[MessageRecord]] = defaultdict(list)
+        for r in to_move:
+            by_bucket[r.classification].append(r)
+
+        print("\n" + "=" * 50)
+        print("EXECUTION PREVIEW")
+        print("=" * 50)
+        for cls, recs in by_bucket.items():
+            print(f"  {cls.value:<12} {len(recs):>6,}  → {folder_map[cls]}")
+        if len(to_move) == self.max_moves:
+            print(f"  (capped at max_moves_per_run={self.max_moves})")
+        print("=" * 50)
+        answer = input("\nProceed with these moves? [y/N] ").strip().lower()
+        if answer != "y":
+            print("  Aborted — no changes made.")
+            return {}
+
+        # Resolve folder IDs (auto-create if missing)
+        folder_ids: dict[Classification, str] = {}
+        for cls in by_bucket:
+            name = folder_map[cls]
+            print(f"  📁 Resolving folder '{name}' …")
+            folder_ids[cls] = self.client.get_or_create_folder(name)
+
+        # Execute moves
+        results: dict[Classification, dict] = defaultdict(lambda: {"moved": 0, "failed": 0})
+        total = len(to_move)
+        for i, rec in enumerate(to_move, 1):
+            if i % 100 == 0 or i == total:
+                print(f"  Moving {i}/{total} …", flush=True)
+            try:
+                self.client.move_message(rec.message_id, folder_ids[rec.classification])
+                results[rec.classification]["moved"] += 1
+            except Exception:
+                results[rec.classification]["failed"] += 1
+
+        print("\n" + "=" * 50)
+        print("EXECUTION COMPLETE")
+        print("=" * 50)
+        for cls, counts in results.items():
+            print(f"  {cls.value:<12}  moved: {counts['moved']:,}  failed: {counts['failed']:,}")
+        print("=" * 50)
+        return dict(results)
+
+
+# ============================================================
 # Main entry point
 # ============================================================
 def main():
@@ -663,6 +764,11 @@ def main():
         "--reauth",
         action="store_true",
         help="Clear cached credentials and sign in fresh (use this to switch accounts)",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute moves — actually move emails to destination folders (default: dry-run only)",
     )
     args = parser.parse_args()
 
@@ -717,6 +823,11 @@ def main():
     records = [classifier.classify(msg) for msg in raw_messages]
     print("✅ Classification complete\n")
 
+    # ── Execution mode ─────────────────────────────────────
+    if args.execute:
+        engine = ExecutionEngine(client, config, records)
+        engine.run()
+
     # ── Generate reports ───────────────────────────────────
     REPORT_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -724,17 +835,18 @@ def main():
 
     reporter = ReportGenerator(config, records)
 
+    prefix = "execute" if args.execute else "dryrun"
     if "markdown" in formats:
-        md_path = REPORT_DIR / f"dryrun_{timestamp}.md"
+        md_path = REPORT_DIR / f"{prefix}_{timestamp}.md"
         reporter.generate_markdown(md_path)
 
     if "csv" in formats:
-        csv_path = REPORT_DIR / f"dryrun_{timestamp}.csv"
+        csv_path = REPORT_DIR / f"{prefix}_{timestamp}.csv"
         reporter.generate_csv(csv_path)
 
     # ── Print quick summary to console ─────────────────────
     print("\n" + "=" * 50)
-    print("DRY RUN SUMMARY")
+    print("EXECUTION SUMMARY" if args.execute else "DRY RUN SUMMARY")
     print("=" * 50)
     for cls in Classification:
         cnt = len(reporter.buckets[cls])
