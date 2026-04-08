@@ -385,7 +385,12 @@ class GraphClient:
         page = 1
         while url:
             print(f"  📬 Fetching page {page} …", end=" ", flush=True)
-            data = self._get(url, params)
+            try:
+                data = self._get(url, params)
+            except Exception as e:
+                print(f"\n  ⚠️ Error fetching page {page}: {e}")
+                print(f"  Stopping inbox fetch early — {len(all_messages):,} messages retrieved so far.")
+                break
             batch = data.get("value", [])
             all_messages.extend(batch)
             print(f"got {len(batch)} messages (total: {len(all_messages)})")
@@ -867,29 +872,51 @@ def main():
     protected = client.get_sent_conversation_ids()
     print(f"✅ Protected threads: {len(protected):,}\n")
 
-    # ── Fetch Inbox messages ───────────────────────────────
+    # ── Fetch Inbox messages + Classify ───────────────────────
     include_body = config.get("report", {}).get("include_body_snippet", False)
-    print("📥 Fetching Inbox messages …")
-    raw_messages = client.get_inbox_messages(
-        limit=args.limit,
-        include_body=include_body,
-    )
-    print(f"✅ Fetched {len(raw_messages):,} messages\n")
+    raw_messages = []
+    records = []
 
-    if not raw_messages:
-        print("No messages found. Exiting.")
-        return
+    try:
+        print("📥 Fetching Inbox messages …")
+        raw_messages = client.get_inbox_messages(
+            limit=args.limit,
+            include_body=include_body,
+        )
+        print(f"✅ Fetched {len(raw_messages):,} messages\n")
 
-    # ── Build recently-engaged sender index ────────────────
-    print("🔍 Building recently-engaged sender index …")
-    engaged_domains = EmailClassifier.build_engaged_domains(raw_messages, config)
-    print(f"✅ Recently engaged domains: {len(engaged_domains):,}\n")
+        if not raw_messages:
+            print("No messages found. Exiting.")
+            return
 
-    # ── Classify ───────────────────────────────────────────
-    print("🔍 Classifying messages …")
-    classifier = EmailClassifier(config, protected, engaged_domains)
-    records = [classifier.classify(msg) for msg in raw_messages]
-    print("✅ Classification complete\n")
+        # ── Build recently-engaged sender index ────────────────
+        print("🔍 Building recently-engaged sender index …")
+        engaged_domains = EmailClassifier.build_engaged_domains(raw_messages, config)
+        print(f"✅ Recently engaged domains: {len(engaged_domains):,}\n")
+
+        # ── Classify ───────────────────────────────────────────
+        print("🔍 Classifying messages …")
+        classifier = EmailClassifier(config, protected, engaged_domains)
+        classify_errors = 0
+        for msg in raw_messages:
+            try:
+                records.append(classifier.classify(msg))
+            except Exception as e:
+                classify_errors += 1
+                if classify_errors <= 3:
+                    print(f"  ⚠️ Classification error (skipping message): {e}")
+                elif classify_errors == 4:
+                    print("  ⚠️ Further classification errors suppressed …")
+        if classify_errors:
+            print(f"  ⚠️ {classify_errors} message(s) skipped due to classification errors")
+        print("✅ Classification complete\n")
+
+    except Exception as e:
+        print(f"\n⚠️ Processing stopped early: {e}")
+        if not records:
+            print("  No messages classified yet. Exiting.")
+            return
+        print(f"  Proceeding to execution with {len(records):,} already-classified messages …\n")
 
     # ── Execution mode ─────────────────────────────────────
     if args.execute:
