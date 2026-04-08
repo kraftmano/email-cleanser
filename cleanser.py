@@ -244,13 +244,13 @@ class GraphClient:
             }
         )
 
-    def _get(self, url: str, params: dict = None) -> dict:
-        resp = self.session.get(url, params=params)
+    def _get(self, url: str, params: dict = None, _retries: int = 3) -> dict:
+        resp = self.session.get(url, params=params, timeout=30)
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 5))
             print(f"  ⏳ Throttled — waiting {retry_after}s …")
             time.sleep(retry_after)
-            return self._get(url, params)
+            return self._get(url, params, _retries)
         resp.raise_for_status()
         return resp.json()
 
