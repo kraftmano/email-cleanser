@@ -698,8 +698,6 @@ class ExecutionEngine:
         self.client = client
         self.cfg = config
         self.records = records
-        self.max_moves = config.get("max_moves_per_run", 2000)
-
     def run(self) -> dict:
         folders_cfg = self.cfg.get("folders", {})
         folder_map = {
@@ -708,7 +706,6 @@ class ExecutionEngine:
         }
 
         to_move = [r for r in self.records if r.classification in self.ACTIONABLE]
-        to_move = to_move[: self.max_moves]
 
         if not to_move:
             print("  Nothing to move.")
@@ -724,8 +721,6 @@ class ExecutionEngine:
         print("=" * 50)
         for cls, recs in by_bucket.items():
             print(f"  {cls.value:<12} {len(recs):>6,}  → {folder_map[cls]}")
-        if len(to_move) == self.max_moves:
-            print(f"  (capped at max_moves_per_run={self.max_moves})")
         print("=" * 50)
         answer = input("\nProceed with these moves? [y/N] ").strip().lower()
         if answer != "y":
