@@ -234,33 +234,52 @@ class GraphClient:
 
     PAGE_SIZE = 250  # messages per request (max 1000, 250 is safe)
 
-    def __init__(self, token: str):
-        self.token = token
+    def __init__(self, auth: "GraphAuth"):
+        self.auth = auth
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            }
-        )
+        self._apply_token(auth.get_token())
 
-    def _get(self, url: str, params: dict = None, _retries: int = 3) -> dict:
+    def _apply_token(self, token: str):
+        self.session.headers.update({"Authorization": f"Bearer {token}"})
+        self.session.headers.setdefault("Content-Type", "application/json")
+
+    def _refresh_token(self):
+        """Silently refresh the access token (called on 401)."""
+        print("  🔄 Token expired — refreshing …")
+        # Force MSAL to fetch a new token (bypass silent cache)
+        accounts = self.auth.app.get_accounts()
+        if accounts:
+            result = self.auth.app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
+            if result and "access_token" in result:
+                self.auth._save_cache()
+                self._apply_token(result["access_token"])
+                return
+        # Fallback: full device flow (shouldn't normally happen)
+        self._apply_token(self.auth.get_token())
+
+    def _get(self, url: str, params: dict = None, _retried: bool = False) -> dict:
         resp = self.session.get(url, params=params, timeout=30)
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 5))
             print(f"  ⏳ Throttled — waiting {retry_after}s …")
             time.sleep(retry_after)
-            return self._get(url, params, _retries)
+            return self._get(url, params, _retried)
+        if resp.status_code == 401 and not _retried:
+            self._refresh_token()
+            return self._get(url, params, _retried=True)
         resp.raise_for_status()
         return resp.json()
 
-    def _post(self, url: str, data: dict) -> dict:
+    def _post(self, url: str, data: dict, _retried: bool = False) -> dict:
         resp = self.session.post(url, json=data, timeout=30)
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 5))
             print(f"  ⏳ Throttled — waiting {retry_after}s …")
             time.sleep(retry_after)
-            return self._post(url, data)
+            return self._post(url, data, _retried)
+        if resp.status_code == 401 and not _retried:
+            self._refresh_token()
+            return self._post(url, data, _retried=True)
         resp.raise_for_status()
         return resp.json()
 
@@ -782,8 +801,8 @@ def main():
     if args.reauth:
         auth.clear_cache()
         print("  Re-authentication requested — you will be prompted to sign in.")
-    token = auth.get_token()
-    client = GraphClient(token)
+    auth.get_token()  # ensure initial token is cached
+    client = GraphClient(auth)
 
     # Verify and display which account we're connected to
     try:
