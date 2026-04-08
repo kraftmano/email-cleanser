@@ -427,6 +427,7 @@ class EmailClassifier:
         # ── 1) Newsletter check ────────────────────────────
         if domain in self.cfg["newsletter_domains"]:
             rec.matched_newsletter_rule = True
+            rec.keep_subscription = True
             rec.classification = Classification.NEWSLETTER
             rec.rule_triggers.append(f"newsletter_domain={domain}")
             return rec
