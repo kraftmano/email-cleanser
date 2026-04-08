@@ -257,31 +257,85 @@ class GraphClient:
         # Fallback: full device flow (shouldn't normally happen)
         self._apply_token(self.auth.get_token())
 
-    def _get(self, url: str, params: dict = None, _retried: bool = False) -> dict:
-        resp = self.session.get(url, params=params, timeout=30)
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 5))
-            print(f"  ⏳ Throttled — waiting {retry_after}s …")
-            time.sleep(retry_after)
-            return self._get(url, params, _retried)
-        if resp.status_code == 401 and not _retried:
-            self._refresh_token()
-            return self._get(url, params, _retried=True)
-        resp.raise_for_status()
-        return resp.json()
+    def _get(self, url: str, params: dict = None) -> dict:
+        max_retries = 5
+        base_delay = 2
+        auth_refreshed = False
 
-    def _post(self, url: str, data: dict, _retried: bool = False) -> dict:
-        resp = self.session.post(url, json=data, timeout=30)
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 5))
-            print(f"  ⏳ Throttled — waiting {retry_after}s …")
-            time.sleep(retry_after)
-            return self._post(url, data, _retried)
-        if resp.status_code == 401 and not _retried:
-            self._refresh_token()
-            return self._post(url, data, _retried=True)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(max_retries):
+            try:
+                resp = self.session.get(url, params=params, timeout=90)
+
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after and retry_after.isdigit():
+                        delay = int(retry_after)
+                    else:
+                        delay = base_delay * (2 ** attempt)
+                    print(f"  ⏳ Throttled — waiting {delay}s …")
+                    time.sleep(delay)
+                    continue
+
+                if resp.status_code == 401:
+                    if not auth_refreshed:
+                        print("  🔄 Token expired — refreshing …")
+                        self._refresh_token()
+                        auth_refreshed = True
+                        continue
+                    resp.raise_for_status()
+
+                resp.raise_for_status()
+                return resp.json()
+
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"  ⚠️ Request failed ({type(e).__name__}) — retrying in {delay}s …")
+                    time.sleep(delay)
+                    continue
+                raise
+
+        raise RuntimeError(f"GET request failed after {max_retries} attempts: {url}")
+
+    def _post(self, url: str, data: dict) -> dict:
+        max_retries = 5
+        base_delay = 2
+        auth_refreshed = False
+
+        for attempt in range(max_retries):
+            try:
+                resp = self.session.post(url, json=data, timeout=90)
+
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after and retry_after.isdigit():
+                        delay = int(retry_after)
+                    else:
+                        delay = base_delay * (2 ** attempt)
+                    print(f"  ⏳ Throttled — waiting {delay}s …")
+                    time.sleep(delay)
+                    continue
+
+                if resp.status_code == 401:
+                    if not auth_refreshed:
+                        print("  🔄 Token expired — refreshing …")
+                        self._refresh_token()
+                        auth_refreshed = True
+                        continue
+                    resp.raise_for_status()
+
+                resp.raise_for_status()
+                return resp.json()
+
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"  ⚠️ Request failed ({type(e).__name__}) — retrying in {delay}s …")
+                    time.sleep(delay)
+                    continue
+                raise
+
+        raise RuntimeError(f"POST request failed after {max_retries} attempts: {url}")
 
     def get_or_create_folder(self, display_name: str) -> str:
         """Return folder ID by display name, creating it if it doesn't exist."""
