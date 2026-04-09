@@ -1,5 +1,6 @@
 .env
 .token_cache.json
+progress.json
 reports/
 __pycache__/
 *.pyc

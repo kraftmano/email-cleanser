@@ -358,14 +358,15 @@ class GraphClient:
         data = self._get(f"{GRAPH_BASE}/me/mailFolders/Inbox")
         return data["id"]
 
-    def get_inbox_messages(
+    def iter_inbox_pages(
         self,
         limit: Optional[int] = None,
         include_body: bool = False,
-    ) -> list[dict]:
+        resume_after: Optional[str] = None,
+    ):
         """
-        Fetch all Inbox messages (paginated).
-        Returns list of raw Graph message dicts.
+        Yield one page of Inbox messages at a time (newest-first).
+        resume_after: ISO datetime string — if set, only fetches messages older than this.
         """
         fields = (
             "id,subject,sender,from,receivedDateTime,isRead,"
@@ -380,8 +381,10 @@ class GraphClient:
             "$top": min(self.PAGE_SIZE, limit) if limit else self.PAGE_SIZE,
             "$orderby": "receivedDateTime desc",
         }
+        if resume_after:
+            params["$filter"] = f"receivedDateTime lt '{resume_after}'"
 
-        all_messages = []
+        fetched = 0
         page = 1
         while url:
             print(f"  📬 Fetching page {page} …", end=" ", flush=True)
@@ -389,20 +392,29 @@ class GraphClient:
                 data = self._get(url, params)
             except Exception as e:
                 print(f"\n  ⚠️ Error fetching page {page}: {e}")
-                print(f"  Stopping inbox fetch early — {len(all_messages):,} messages retrieved so far.")
-                break
+                print(f"  Stopping inbox fetch early — {fetched:,} messages fetched so far.")
+                return
             batch = data.get("value", [])
-            all_messages.extend(batch)
-            print(f"got {len(batch)} messages (total: {len(all_messages)})")
-
-            if limit and len(all_messages) >= limit:
-                all_messages = all_messages[:limit]
-                break
-
+            if limit:
+                batch = batch[:limit - fetched]
+            print(f"got {len(batch)}")
+            yield batch
+            fetched += len(batch)
+            if limit and fetched >= limit:
+                return
             url = data.get("@odata.nextLink")
             params = None  # nextLink includes params
             page += 1
 
+    def get_inbox_messages(
+        self,
+        limit: Optional[int] = None,
+        include_body: bool = False,
+    ) -> list[dict]:
+        """Fetch all Inbox messages at once. Used by dry-run mode."""
+        all_messages = []
+        for page in self.iter_inbox_pages(limit=limit, include_body=include_body):
+            all_messages.extend(page)
         return all_messages
 
     def get_sent_conversation_ids(self) -> set[str]:
@@ -823,6 +835,11 @@ def main():
         action="store_true",
         help="Execute moves — actually move emails to destination folders (default: dry-run only)",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Ignore any saved progress and start from the beginning (use with --execute)",
+    )
     args = parser.parse_args()
 
     # ── Load config ────────────────────────────────────────
@@ -852,54 +869,87 @@ def main():
     protected = client.get_sent_conversation_ids()
     print(f"✅ Protected threads: {len(protected):,}\n")
 
-    # ── Fetch Inbox messages + Classify ───────────────────────
+    # ── Load progress (execute mode only) ─────────────────────
     include_body = config.get("report", {}).get("include_body_snippet", False)
-    raw_messages = []
+    progress_file = Path(__file__).parent / "progress.json"
+    resume_after: Optional[str] = None
+    engaged_domains: set[str] = set()
+    total_processed = 0
+
+    if args.execute:
+        if args.fresh and progress_file.exists():
+            progress_file.unlink()
+            print("🗑️  Progress file cleared — starting fresh.\n")
+        elif not args.fresh and progress_file.exists():
+            try:
+                prog = json.loads(progress_file.read_text(encoding="utf-8"))
+                resume_after = prog.get("resume_after")
+                engaged_domains = set(prog.get("engaged_domains", []))
+                total_processed = prog.get("processed_count", 0)
+                print(f"↩️  Resuming — {total_processed:,} already processed, skipping emails newer than {resume_after}\n")
+            except Exception:
+                print("  ⚠️ Could not read progress file — starting fresh.\n")
+
+    # ── Setup engine and classifier ────────────────────────────
     records = []
     engine = None
+    if args.execute:
+        engine = ExecutionEngine(client, config)
+        engine.prepare()
+
+    classifier = EmailClassifier(config, protected, engaged_domains)
+
+    # ── Per-page fetch + classify (+ inline move) ──────────────
+    print("🔍 Classifying and moving messages …" if args.execute else "🔍 Fetching and classifying messages …")
+    classify_errors = 0
 
     try:
-        print("📥 Fetching Inbox messages …")
-        raw_messages = client.get_inbox_messages(
+        any_pages = False
+        for page_msgs in client.iter_inbox_pages(
             limit=args.limit,
             include_body=include_body,
-        )
-        print(f"✅ Fetched {len(raw_messages):,} messages\n")
+            resume_after=resume_after,
+        ):
+            any_pages = True
+            # Update engagement index from this page before classifying it
+            engaged_domains |= EmailClassifier.build_engaged_domains(page_msgs, config)
 
-        if not raw_messages:
+            for msg in page_msgs:
+                try:
+                    rec = classifier.classify(msg)
+                    records.append(rec)
+                    if engine:
+                        engine.execute_one(rec)
+                except Exception as e:
+                    classify_errors += 1
+                    if classify_errors <= 3:
+                        print(f"  ⚠️ Classification error (skipping message): {e}")
+                    elif classify_errors == 4:
+                        print("  ⚠️ Further classification errors suppressed …")
+
+            total_processed += len(page_msgs)
+            print(f"  Total processed: {total_processed:,}", flush=True)
+
+            # Save progress after each page (execute mode only)
+            if args.execute and page_msgs:
+                oldest = min(page_msgs, key=lambda m: m["receivedDateTime"])
+                progress_file.write_text(json.dumps({
+                    "resume_after": oldest["receivedDateTime"],
+                    "engaged_domains": list(engaged_domains),
+                    "processed_count": total_processed,
+                }, indent=2), encoding="utf-8")
+
+        if not any_pages:
             print("No messages found. Exiting.")
             return
 
-        # ── Build recently-engaged sender index ────────────────
-        print("🔍 Building recently-engaged sender index …")
-        engaged_domains = EmailClassifier.build_engaged_domains(raw_messages, config)
-        print(f"✅ Recently engaged domains: {len(engaged_domains):,}\n")
-
-        # ── Classify (+ inline execution if --execute) ────────────
-        print("🔍 Classifying messages …" if not args.execute else "🔍 Classifying and moving messages …")
-        classifier = EmailClassifier(config, protected, engaged_domains)
-        if args.execute:
-            engine = ExecutionEngine(client, config)
-            engine.prepare()
-        total_msgs = len(raw_messages)
-        classify_errors = 0
-        for i, msg in enumerate(raw_messages, 1):
-            try:
-                rec = classifier.classify(msg)
-                records.append(rec)
-                if engine:
-                    engine.execute_one(rec)
-            except Exception as e:
-                classify_errors += 1
-                if classify_errors <= 3:
-                    print(f"  ⚠️ Classification error (skipping message): {e}")
-                elif classify_errors == 4:
-                    print("  ⚠️ Further classification errors suppressed …")
-            if i % 100 == 0 or i == total_msgs:
-                print(f"  Processed {i:,}/{total_msgs:,} …", flush=True)
         if classify_errors:
             print(f"  ⚠️ {classify_errors} message(s) skipped due to classification errors")
         print("✅ Done\n")
+
+        # Clean up progress file on successful completion
+        if args.execute and progress_file.exists():
+            progress_file.unlink()
 
     except Exception as e:
         print(f"\n⚠️ Processing stopped early: {e}")
