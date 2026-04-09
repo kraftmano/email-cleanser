@@ -749,69 +749,49 @@ class ReportGenerator:
 # Execution engine (v2)
 # ============================================================
 class ExecutionEngine:
-    """Moves classified emails to their destination folders."""
+    """Moves classified emails to their destination folders inline as they are classified."""
 
     ACTIONABLE = {Classification.QUARANTINE, Classification.RECEIPT}
 
-    def __init__(self, client: GraphClient, config: dict, records: list[MessageRecord]):
+    def __init__(self, client: GraphClient, config: dict):
         self.client = client
         self.cfg = config
-        self.records = records
-    def run(self) -> dict:
+        self.folder_ids: dict[Classification, str] = {}
+        self.results: dict = defaultdict(lambda: {"moved": 0, "failed": 0})
+
+    def prepare(self):
+        """Resolve destination folder IDs once upfront, creating folders if needed."""
         folders_cfg = self.cfg.get("folders", {})
         folder_map = {
             Classification.QUARANTINE: folders_cfg.get("quarantine", "CLEANSE_REVIEW"),
             Classification.RECEIPT: folders_cfg.get("receipts", "Receipts"),
         }
+        print("📁 Resolving destination folders …")
+        for cls, name in folder_map.items():
+            self.folder_ids[cls] = self.client.get_or_create_folder(name)
+            print(f"  {cls.value:<12} → {name}")
+        print()
 
-        to_move = [r for r in self.records if r.classification in self.ACTIONABLE]
+    def execute_one(self, rec: MessageRecord):
+        """Move a single message if it is actionable. Tracks results."""
+        if rec.classification not in self.ACTIONABLE:
+            return
+        try:
+            self.client.move_message(rec.message_id, self.folder_ids[rec.classification])
+            self.results[rec.classification]["moved"] += 1
+        except Exception:
+            self.results[rec.classification]["failed"] += 1
 
-        if not to_move:
-            print("  Nothing to move.")
-            return {}
-
-        # Show summary and ask for confirmation
-        by_bucket: dict[Classification, list[MessageRecord]] = defaultdict(list)
-        for r in to_move:
-            by_bucket[r.classification].append(r)
-
-        print("\n" + "=" * 50)
-        print("EXECUTION PREVIEW")
-        print("=" * 50)
-        for cls, recs in by_bucket.items():
-            print(f"  {cls.value:<12} {len(recs):>6,}  → {folder_map[cls]}")
-        print("=" * 50)
-        answer = input("\nProceed with these moves? [y/N] ").strip().lower()
-        if answer != "y":
-            print("  Aborted — no changes made.")
-            return {}
-
-        # Resolve folder IDs (auto-create if missing)
-        folder_ids: dict[Classification, str] = {}
-        for cls in by_bucket:
-            name = folder_map[cls]
-            print(f"  📁 Resolving folder '{name}' …")
-            folder_ids[cls] = self.client.get_or_create_folder(name)
-
-        # Execute moves
-        results: dict[Classification, dict] = defaultdict(lambda: {"moved": 0, "failed": 0})
-        total = len(to_move)
-        for i, rec in enumerate(to_move, 1):
-            if i % 100 == 0 or i == total:
-                print(f"  Moving {i}/{total} …", flush=True)
-            try:
-                self.client.move_message(rec.message_id, folder_ids[rec.classification])
-                results[rec.classification]["moved"] += 1
-            except Exception:
-                results[rec.classification]["failed"] += 1
-
+    def print_summary(self):
+        """Print moved/failed counts per classification."""
         print("\n" + "=" * 50)
         print("EXECUTION COMPLETE")
         print("=" * 50)
-        for cls, counts in results.items():
+        if not self.results:
+            print("  Nothing was moved.")
+        for cls, counts in self.results.items():
             print(f"  {cls.value:<12}  moved: {counts['moved']:,}  failed: {counts['failed']:,}")
         print("=" * 50)
-        return dict(results)
 
 
 # ============================================================
@@ -876,6 +856,7 @@ def main():
     include_body = config.get("report", {}).get("include_body_snippet", False)
     raw_messages = []
     records = []
+    engine = None
 
     try:
         print("📥 Fetching Inbox messages …")
@@ -894,34 +875,41 @@ def main():
         engaged_domains = EmailClassifier.build_engaged_domains(raw_messages, config)
         print(f"✅ Recently engaged domains: {len(engaged_domains):,}\n")
 
-        # ── Classify ───────────────────────────────────────────
-        print("🔍 Classifying messages …")
+        # ── Classify (+ inline execution if --execute) ────────────
+        print("🔍 Classifying messages …" if not args.execute else "🔍 Classifying and moving messages …")
         classifier = EmailClassifier(config, protected, engaged_domains)
+        if args.execute:
+            engine = ExecutionEngine(client, config)
+            engine.prepare()
+        total_msgs = len(raw_messages)
         classify_errors = 0
-        for msg in raw_messages:
+        for i, msg in enumerate(raw_messages, 1):
             try:
-                records.append(classifier.classify(msg))
+                rec = classifier.classify(msg)
+                records.append(rec)
+                if engine:
+                    engine.execute_one(rec)
             except Exception as e:
                 classify_errors += 1
                 if classify_errors <= 3:
                     print(f"  ⚠️ Classification error (skipping message): {e}")
                 elif classify_errors == 4:
                     print("  ⚠️ Further classification errors suppressed …")
+            if i % 100 == 0 or i == total_msgs:
+                print(f"  Processed {i:,}/{total_msgs:,} …", flush=True)
         if classify_errors:
             print(f"  ⚠️ {classify_errors} message(s) skipped due to classification errors")
-        print("✅ Classification complete\n")
+        print("✅ Done\n")
 
     except Exception as e:
         print(f"\n⚠️ Processing stopped early: {e}")
         if not records:
             print("  No messages classified yet. Exiting.")
             return
-        print(f"  Proceeding to execution with {len(records):,} already-classified messages …\n")
+        print(f"  Proceeding with {len(records):,} already-processed messages …\n")
 
-    # ── Execution mode ─────────────────────────────────────
-    if args.execute:
-        engine = ExecutionEngine(client, config, records)
-        engine.run()
+    if args.execute and engine:
+        engine.print_summary()
 
     # ── Generate reports ───────────────────────────────────
     REPORT_DIR.mkdir(exist_ok=True)
