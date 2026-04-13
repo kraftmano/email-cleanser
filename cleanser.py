@@ -361,7 +361,6 @@ class GraphClient:
     def iter_inbox_pages(
         self,
         limit: Optional[int] = None,
-        include_body: bool = False,
         resume_after: Optional[str] = None,
     ):
         """
@@ -370,10 +369,8 @@ class GraphClient:
         """
         fields = (
             "id,subject,sender,from,receivedDateTime,isRead,"
-            "conversationId,internetMessageHeaders"
+            "conversationId,internetMessageHeaders,bodyPreview"
         )
-        if include_body:
-            fields += ",bodyPreview"
 
         url = f"{GRAPH_BASE}/me/mailFolders/Inbox/messages"
         params = {
@@ -409,11 +406,10 @@ class GraphClient:
     def get_inbox_messages(
         self,
         limit: Optional[int] = None,
-        include_body: bool = False,
     ) -> list[dict]:
         """Fetch all Inbox messages at once. Used by dry-run mode."""
         all_messages = []
-        for page in self.iter_inbox_pages(limit=limit, include_body=include_body):
+        for page in self.iter_inbox_pages(limit=limit):
             all_messages.extend(page)
         return all_messages
 
@@ -763,7 +759,7 @@ class ReportGenerator:
 class ExecutionEngine:
     """Moves classified emails to their destination folders inline as they are classified."""
 
-    ACTIONABLE = {Classification.QUARANTINE, Classification.RECEIPT}
+    ACTIONABLE = {Classification.NEWSLETTER, Classification.QUARANTINE, Classification.RECEIPT}
 
     def __init__(self, client: GraphClient, config: dict):
         self.client = client
@@ -775,6 +771,7 @@ class ExecutionEngine:
         """Resolve destination folder IDs once upfront, creating folders if needed."""
         folders_cfg = self.cfg.get("folders", {})
         folder_map = {
+            Classification.NEWSLETTER: folders_cfg.get("newsletters", "Newsletters"),
             Classification.QUARANTINE: folders_cfg.get("quarantine", "CLEANSE_REVIEW"),
             Classification.RECEIPT: folders_cfg.get("receipts", "Receipts"),
         }
@@ -870,7 +867,6 @@ def main():
     print(f"✅ Protected threads: {len(protected):,}\n")
 
     # ── Load progress (execute mode only) ─────────────────────
-    include_body = config.get("report", {}).get("include_body_snippet", False)
     progress_file = Path(__file__).parent / "progress.json"
     resume_after: Optional[str] = None
     engaged_domains: set[str] = set()
@@ -907,7 +903,6 @@ def main():
         any_pages = False
         for page_msgs in client.iter_inbox_pages(
             limit=args.limit,
-            include_body=include_body,
             resume_after=resume_after,
         ):
             any_pages = True

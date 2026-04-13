@@ -50,7 +50,7 @@ receipt_sender_domains:
   # Add trusted merchant domains here
 
 # ── Quarantine (unwanted marketing) ─────────────────────────
-quarantine_age_days: 30          # only quarantine messages older than this
+quarantine_age_days: 14          # only quarantine messages older than this
 engagement_window_days: 60       # keep subscription if you've read a newsletter from this sender within this window
 
 # Unsubscribe signals searched in headers and body
