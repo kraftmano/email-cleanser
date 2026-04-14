@@ -369,7 +369,7 @@ class GraphClient:
         """
         fields = (
             "id,subject,sender,from,receivedDateTime,isRead,"
-            "conversationId,internetMessageHeaders,bodyPreview"
+            "conversationId,internetMessageHeaders,bodyPreview,meetingMessageType"
         )
 
         url = f"{GRAPH_BASE}/me/mailFolders/Inbox/messages"
@@ -450,7 +450,13 @@ class EmailClassifier:
         self.protected_threads = protected_threads
         self.recently_engaged_domains = recently_engaged_domains or set()
         self.cutoff = datetime.now(timezone.utc) - timedelta(
-            days=config.get("quarantine_age_days", 30)
+            days=config.get("quarantine_age_days", 14)
+        )
+        self.calendar_cutoff = datetime.now(timezone.utc) - timedelta(
+            days=config.get("calendar_invite_age_days", 14)
+        )
+        self.unread_cutoff = datetime.now(timezone.utc) - timedelta(
+            days=config.get("quarantine_unread_age_days", 30)
         )
 
     @staticmethod
@@ -565,24 +571,33 @@ class EmailClassifier:
                 rec.rule_triggers.append(f"receipt_keyword='{kw}'")
                 return rec
 
-        # ── 3) Quarantine check ────────────────────────────
+        # ── Common quarantine guards (used by rules 3–5) ──────────
+        is_protected = conv_id in self.protected_threads
+        is_excluded_domain = domain in self.cfg["excluded_sender_domains"]
+        is_excluded_addr = email in self.cfg["excluded_sender_addresses"]
+        not_excluded = not is_protected and not is_excluded_domain and not is_excluded_addr
+
+        # ── 3) Calendar invite check ───────────────────────────
+        meeting_type = raw.get("meetingMessageType") or "none"
+        if meeting_type != "none" and received < self.calendar_cutoff and not_excluded:
+            rec.matched_quarantine_rule = True
+            rec.classification = Classification.QUARANTINE
+            rec.rule_triggers = [
+                f"calendar invite ({meeting_type})",
+                f"older than {self.cfg.get('calendar_invite_age_days', 14)}d",
+            ]
+            return rec
+
+        # ── 4) Unsubscribe-signal quarantine ───────────────────
         unsub_header = self._has_unsubscribe_header(raw)
         unsub_body = self._has_unsubscribe_body(raw)
         rec.has_unsubscribe_signal = unsub_header or unsub_body
 
-        is_old = received < self.cutoff
-        is_protected = conv_id in self.protected_threads
-        is_excluded_domain = domain in self.cfg["excluded_sender_domains"]
-        is_excluded_addr = email in self.cfg["excluded_sender_addresses"]
-
         if (
             not is_read
-            and is_old
+            and received < self.cutoff
             and rec.has_unsubscribe_signal
-            and not rec.matched_receipt_rule
-            and not is_protected
-            and not is_excluded_domain
-            and not is_excluded_addr
+            and not_excluded
         ):
             rec.matched_quarantine_rule = True
             rec.classification = Classification.QUARANTINE
@@ -598,7 +613,18 @@ class EmailClassifier:
             rec.rule_triggers = triggers
             return rec
 
-        # ── 4) Untouched ──────────────────────────────────
+        # ── 5) Broad unread quarantine ─────────────────────────
+        if not is_read and received < self.unread_cutoff and not_excluded:
+            rec.matched_quarantine_rule = True
+            rec.classification = Classification.QUARANTINE
+            triggers = [f"unread + older than {self.cfg.get('quarantine_unread_age_days', 30)}d"]
+            if domain in self.recently_engaged_domains:
+                rec.keep_subscription = True
+                triggers.append(f"keep_subscription (read within {self.cfg.get('engagement_window_days', 60)}d)")
+            rec.rule_triggers = triggers
+            return rec
+
+        # ── 6) Untouched ──────────────────────────────────────
         rec.classification = Classification.UNTOUCHED
         return rec
 
