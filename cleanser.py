@@ -455,6 +455,12 @@ class EmailClassifier:
         self.calendar_cutoff = datetime.now(timezone.utc) - timedelta(
             days=config.get("calendar_invite_age_days", 14)
         )
+        self.verification_cutoff = datetime.now(timezone.utc) - timedelta(
+            days=config.get("verification_age_days", 1)
+        )
+        self.notification_cutoff = datetime.now(timezone.utc) - timedelta(
+            days=config.get("notification_age_days", 30)
+        )
         self.unread_cutoff = datetime.now(timezone.utc) - timedelta(
             days=config.get("quarantine_unread_age_days", 30)
         )
@@ -521,6 +527,20 @@ class EmailClassifier:
                 return True
         return False
 
+    def _is_newsletter_by_signals(self, raw: dict) -> bool:
+        """Detect newsletter platform routing via internet message headers."""
+        signals = self.cfg.get("newsletter_platform_signals", [])
+        if not signals:
+            return False
+        headers = raw.get("internetMessageHeaders", []) or []
+        for h in headers:
+            name = h.get("name", "").lower()
+            value = h.get("value", "").lower()
+            for signal in signals:
+                if signal in name or signal in value:
+                    return True
+        return False
+
     def classify(self, raw: dict) -> MessageRecord:
         name, email, domain = self._extract_sender(raw)
         received = datetime.fromisoformat(
@@ -551,6 +571,14 @@ class EmailClassifier:
             rec.rule_triggers.append(f"newsletter_domain={domain}")
             return rec
 
+        # ── 1b) Newsletter platform signal (header-based) ──
+        if self._is_newsletter_by_signals(raw):
+            rec.matched_newsletter_rule = True
+            rec.keep_subscription = True
+            rec.classification = Classification.NEWSLETTER
+            rec.rule_triggers.append("newsletter_platform_signal")
+            return rec
+
         # ── 2) Receipt check ───────────────────────────────
         # Check sender domain
         if domain in self.cfg["receipt_sender_domains"]:
@@ -577,7 +605,15 @@ class EmailClassifier:
         is_excluded_addr = email in self.cfg["excluded_sender_addresses"]
         not_excluded = not is_protected and not is_excluded_domain and not is_excluded_addr
 
-        # ── 3) Calendar invite check ───────────────────────────
+        # ── 3) Verification/OTP email check ───────────────────
+        for kw in self.cfg.get("verification_keywords", []):
+            if kw in subject_lower and received < self.verification_cutoff and not_excluded:
+                rec.matched_quarantine_rule = True
+                rec.classification = Classification.QUARANTINE
+                rec.rule_triggers = [f"verification: '{kw}'", f"older than {self.cfg.get('verification_age_days', 1)}d"]
+                return rec
+
+        # ── 4) Calendar invite check ───────────────────────────
         is_calendar = raw.get("@odata.type", "") == "#microsoft.graph.eventMessage"
         if is_calendar and received < self.calendar_cutoff and not_excluded:
             rec.matched_quarantine_rule = True
@@ -588,7 +624,15 @@ class EmailClassifier:
             ]
             return rec
 
-        # ── 4) Unsubscribe-signal quarantine ───────────────────
+        # ── 5) Notification email check ────────────────────────
+        for kw in self.cfg.get("notification_keywords", []):
+            if kw in subject_lower and received < self.notification_cutoff and not_excluded:
+                rec.matched_quarantine_rule = True
+                rec.classification = Classification.QUARANTINE
+                rec.rule_triggers = [f"notification: '{kw}'", f"older than {self.cfg.get('notification_age_days', 30)}d"]
+                return rec
+
+        # ── 6) Unsubscribe-signal quarantine ───────────────────
         unsub_header = self._has_unsubscribe_header(raw)
         unsub_body = self._has_unsubscribe_body(raw)
         rec.has_unsubscribe_signal = unsub_header or unsub_body
@@ -613,7 +657,7 @@ class EmailClassifier:
             rec.rule_triggers = triggers
             return rec
 
-        # ── 5) Broad unread quarantine ─────────────────────────
+        # ── 7) Broad unread quarantine ─────────────────────────
         if not is_read and received < self.unread_cutoff and not_excluded:
             rec.matched_quarantine_rule = True
             rec.classification = Classification.QUARANTINE
@@ -624,7 +668,7 @@ class EmailClassifier:
             rec.rule_triggers = triggers
             return rec
 
-        # ── 6) Untouched ──────────────────────────────────────
+        # ── 8) Untouched ──────────────────────────────────────
         rec.classification = Classification.UNTOUCHED
         return rec
 

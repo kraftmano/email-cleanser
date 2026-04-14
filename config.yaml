@@ -20,6 +20,21 @@ newsletter_domains:
   - mailerlite.com
   # Add more newsletter platform domains here
 
+# Platform names searched in internet message headers (catches custom-domain newsletters)
+newsletter_platform_signals:
+  - beehiiv
+  - substack
+  - mailchimp
+  - convertkit
+  - buttondown
+  - mailerlite
+  - sendfox
+  - campaignmonitor
+  - createsend
+  - klaviyo
+  - constantcontact
+  - brevo
+
 # ── Receipt / invoice detection ─────────────────────────────
 receipt_keywords:
   # These are matched case-insensitively against subject lines
@@ -41,19 +56,61 @@ receipt_keywords:
 receipt_sender_domains:
   # Domains whose mail is always treated as a receipt
   - paypal.com
+  - paypal.co.uk
+  - paypal.com.sg
   - square.com
   - stripe.com
   - shopify.com
   - amazon.com
+  - amazon.co.uk
+  - amazon.sg
+  - amazon.com.au
+  - amazon.ca
   - apple.com
   - google.com          # Google Play / Google Store receipts
+  - google.co.uk
+  - google.com.sg
   # Add trusted merchant domains here
 
 # ── Quarantine (unwanted marketing) ─────────────────────────
 quarantine_age_days: 14          # unread + unsubscribe signal: quarantine if older than this
 calendar_invite_age_days: 14     # calendar invites (any read status): quarantine if older than this
+verification_age_days: 1         # verification/OTP emails (any read status): quarantine if older than this
+notification_age_days: 30        # notification emails (any read status): quarantine if older than this
 quarantine_unread_age_days: 30   # any unread email (no unsubscribe signal required): quarantine if older than this
 engagement_window_days: 60       # keep subscription if you've read a newsletter from this sender within this window
+
+# Verification/OTP email detection (matched case-insensitively against subject)
+verification_keywords:
+  - verify your email
+  - verify your account
+  - email verification
+  - verification code
+  - confirm your email
+  - confirm your account
+  - one-time password
+  - one time password
+  - your otp
+  - security code
+  - authentication code
+  - login code
+  - sign-in code
+  - magic link
+  - 2-step verification
+
+# Notification email detection (matched case-insensitively against subject)
+notification_keywords:
+  - notification
+  - you have a new message
+  - new activity
+  - weekly digest
+  - monthly digest
+  - daily digest
+  - weekly summary
+  - monthly summary
+  - activity summary
+  - your weekly
+  - your monthly
 
 # Unsubscribe signals searched in headers and body
 unsubscribe_signals:
