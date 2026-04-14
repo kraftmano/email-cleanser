@@ -369,7 +369,7 @@ class GraphClient:
         """
         fields = (
             "id,subject,sender,from,receivedDateTime,isRead,"
-            "conversationId,internetMessageHeaders,bodyPreview,meetingMessageType"
+            "conversationId,internetMessageHeaders,bodyPreview"
         )
 
         url = f"{GRAPH_BASE}/me/mailFolders/Inbox/messages"
@@ -578,12 +578,12 @@ class EmailClassifier:
         not_excluded = not is_protected and not is_excluded_domain and not is_excluded_addr
 
         # ── 3) Calendar invite check ───────────────────────────
-        meeting_type = raw.get("meetingMessageType") or "none"
-        if meeting_type != "none" and received < self.calendar_cutoff and not_excluded:
+        is_calendar = raw.get("@odata.type", "") == "#microsoft.graph.eventMessage"
+        if is_calendar and received < self.calendar_cutoff and not_excluded:
             rec.matched_quarantine_rule = True
             rec.classification = Classification.QUARANTINE
             rec.rule_triggers = [
-                f"calendar invite ({meeting_type})",
+                "calendar invite",
                 f"older than {self.cfg.get('calendar_invite_age_days', 14)}d",
             ]
             return rec
